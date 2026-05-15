@@ -1,520 +1,775 @@
-// game.js — Bomb Party main logic
-import { initializeApp }            from 'https://www.gstatic.com/firebasejs/10.11.0/firebase-app.js';
-import { getFirestore, doc, setDoc, getDoc, updateDoc, onSnapshot, arrayUnion, serverTimestamp }
+import { initializeApp }   from 'https://www.gstatic.com/firebasejs/10.11.0/firebase-app.js';
+import { getFirestore, doc, setDoc, getDoc, updateDoc, onSnapshot, arrayUnion }
   from 'https://www.gstatic.com/firebasejs/10.11.0/firebase-firestore.js';
-import firebaseConfig                from './firebase-config.js';
+import firebaseConfig        from './firebase-config.js';
 import { isValidWord, randomPrompt } from './words.js';
 
-// ── Firebase Init ──────────────────────────────────────────────────────────
+// ── Firebase ───────────────────────────────────────────────────────────────
 const app = initializeApp(firebaseConfig);
 const db  = getFirestore(app);
 
-// ── Game State (client) ────────────────────────────────────────────────────
-let myId       = crypto.randomUUID();
-let myName     = '';
-let roomId     = '';
-let isHost     = false;
-let roomUnsub  = null;   // Firestore listener unsubscriber
-let timerLoop  = null;   // setInterval handle for the countdown
-let lastRoom   = null;   // most recent room snapshot
-let submitting = false;  // prevent double submit
-let MAX_LIVES  = 3;
+// ── Client state ───────────────────────────────────────────────────────────
+const myId   = crypto.randomUUID();
+let myName   = '';
+let roomId   = '';
+let isHost   = false;
+let lastRoom = null;
+let roomUnsub = null;
+let timerRAF  = null;   // requestAnimationFrame handle
+let tickTO    = null;   // setTimeout handle for ticking
+let gameClockTO = null;
+let submitting  = false;
 
-// ── DOM refs ───────────────────────────────────────────────────────────────
-const $ = id => document.getElementById(id);
-
-const views = {
-  home:     $('view-home'),
-  lobby:    $('view-lobby'),
-  game:     $('view-game'),
-  gameover: $('view-gameover'),
+// ── Default settings ───────────────────────────────────────────────────────
+const DEFAULT_SETTINGS = {
+  difficulty:    'beginner',
+  minDuration:   10,        // seconds
+  maxPromptAge:  2,
+  startingLives: 2,
+  maxLives:      3,
+  maxPlayers:    16,
+  bonusAlphabet: Object.fromEntries(
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(l =>
+      [l, (l === 'X' || l === 'Z') ? 0 : 1]
+    )
+  ),
 };
 
-function showView(name) {
-  Object.values(views).forEach(v => v.classList.remove('active'));
-  views[name].classList.add('active');
-}
+// ── DOM helpers ────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const views = { home: $('view-home'), lobby: $('view-lobby'), game: $('view-game'), gameover: $('view-gameover') };
+function showView(name) { Object.values(views).forEach(v => v.classList.remove('active')); views[name].classList.add('active'); }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-function genCode() {
-  return Math.random().toString(36).slice(2, 6).toUpperCase().replace(/[01]/g, 'A');
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 function avatarColor(name) {
-  const colors = ['#4361ee','#7209b7','#2ec4b6','#f4a261','#e63946','#4cc9f0','#fb8500','#43aa8b'];
-  let h = 0;
-  for (const c of name) h = (h * 31 + c.charCodeAt(0)) & 0xffffffff;
-  return colors[Math.abs(h) % colors.length];
+  const palette = ['#5b7fcc','#7c5bbf','#c05050','#5ba87c','#b87c2a','#50a0b0','#a05080','#6a8a40'];
+  let h = 0; for (const c of name) h = (h * 31 + c.charCodeAt(0)) & 0xffffffff;
+  return palette[Math.abs(h) % palette.length];
 }
 
-function showFeedback(msg, type = 'info') {
-  const el = $('input-feedback');
-  el.textContent = msg;
-  el.className = 'input-feedback ' + type;
+function hearts(lives, maxLives) {
+  return Array.from({length: maxLives}, (_,i) =>
+    `<span class="pheart${i >= lives ? ' lost' : ''}">❤</span>`
+  ).join('');
 }
 
-function setWordInputState(enabled) {
-  const inp = $('word-input');
-  inp.disabled = !enabled;
-  if (enabled) { inp.value = ''; inp.focus(); }
+// ── Audio (Web Audio API) ──────────────────────────────────────────────────
+let audioCtx = null;
+function getAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
 }
 
-// ── Room Helpers ───────────────────────────────────────────────────────────
-function roomRef(id) { return doc(db, 'rooms', id); }
+function playTick() {
+  try {
+    const ctx = getAudio();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(680, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(420, ctx.currentTime + 0.04);
+    gain.gain.setValueAtTime(0.22, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.06);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.07);
+  } catch(e) {}
+}
+
+function playExplosion() {
+  try {
+    const ctx = getAudio();
+    const dur = 1.2;
+    const sr = ctx.sampleRate;
+    const buf = ctx.createBuffer(2, sr * dur, sr);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = buf.getChannelData(ch);
+      for (let i = 0; i < d.length; i++) {
+        const t = i / sr;
+        d[i] = (Math.random() * 2 - 1) * Math.exp(-t * 4.5) * 0.9;
+      }
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 400;
+    const gain = ctx.createGain(); gain.gain.value = 1;
+    src.connect(lp); lp.connect(gain); gain.connect(ctx.destination);
+    src.start();
+
+    // rumble
+    const osc = ctx.createOscillator();
+    const og = ctx.createGain();
+    osc.connect(og); og.connect(ctx.destination);
+    osc.type = 'sawtooth'; osc.frequency.value = 55;
+    og.gain.setValueAtTime(0.3, ctx.currentTime);
+    og.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.6);
+    osc.start(); osc.stop(ctx.currentTime + 0.6);
+  } catch(e) {}
+}
+
+function playBonusLife() {
+  try {
+    const ctx = getAudio();
+    [523, 659, 784, 1047].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.connect(g); g.connect(ctx.destination);
+      osc.frequency.value = freq;
+      const t = ctx.currentTime + i * 0.12;
+      g.gain.setValueAtTime(0.15, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+      osc.start(t); osc.stop(t + 0.18);
+    });
+  } catch(e) {}
+}
+
+// Schedule ticking that accelerates as time runs out
+function startTicking(startTime, duration) {
+  stopTicking();
+  function tick() {
+    const remaining = duration - (Date.now() - startTime);
+    if (remaining <= 0) return;
+    playTick();
+    // Interval: 900ms at full time → 100ms at last second
+    const ratio = Math.max(0, remaining / duration);
+    const interval = Math.round(100 + ratio * 800);
+    tickTO = setTimeout(tick, interval);
+  }
+  tick();
+}
+
+function stopTicking() {
+  if (tickTO) { clearTimeout(tickTO); tickTO = null; }
+}
+
+// ── Firestore helpers ──────────────────────────────────────────────────────
+const roomRef = id => doc(db, 'rooms', id);
+
+function genCode() {
+  return Math.random().toString(36).slice(2, 6).toUpperCase().replace(/[01IO]/g, 'A');
+}
 
 async function createRoom() {
   const code = genCode();
-  const data = {
+  await setDoc(roomRef(code), {
     hostId: myId,
     state: 'lobby',
-    players: {
-      [myId]: { name: myName, lives: MAX_LIVES, isAlive: true, order: 0 }
-    },
-    currentPlayerId: null,
-    prompt: null,
-    turnStartTime: null,
-    turnDuration: 10000,
-    usedWords: [],
-    round: 1,
-    winnerId: null,
-    createdAt: serverTimestamp(),
-  };
-  await setDoc(roomRef(code), data);
+    players: { [myId]: { name: myName, lives: DEFAULT_SETTINGS.startingLives, isAlive: true, order: 0, wordCount: 0, longestWord: 0, lettersUsed: {}, bonusEarned: 0 } },
+    currentPlayerId: null, prompt: null, turnStartTime: null,
+    turnDuration: DEFAULT_SETTINGS.minDuration * 1000,
+    usedWords: [], round: 1, winnerId: null,
+    promptFailures: 0, wordCount: 0, gameStartTime: null, lastWord: null,
+    pendingWord: null, settings: DEFAULT_SETTINGS,
+  });
   return code;
 }
 
 async function joinRoom(code, name) {
   const snap = await getDoc(roomRef(code));
-  if (!snap.exists()) throw new Error('Room not found');
+  if (!snap.exists()) throw new Error('Room not found. Check the code!');
   const room = snap.data();
-  if (room.state !== 'lobby') throw new Error('Game already in progress');
-
-  const order = Object.keys(room.players).length;
+  if (room.state !== 'lobby') throw new Error('Game already started!');
+  const count = Object.keys(room.players).length;
+  if (count >= (room.settings?.maxPlayers || 16)) throw new Error('Room is full!');
+  const s = room.settings || DEFAULT_SETTINGS;
   await updateDoc(roomRef(code), {
-    [`players.${myId}`]: { name, lives: MAX_LIVES, isAlive: true, order }
+    [`players.${myId}`]: { name, lives: s.startingLives, isAlive: true, order: count, wordCount: 0, longestWord: 0, lettersUsed: {}, bonusEarned: 0 }
   });
 }
 
-// ── Home View ──────────────────────────────────────────────────────────────
+// ── Home ───────────────────────────────────────────────────────────────────
 $('create-room-btn').addEventListener('click', async () => {
   const name = $('username-input').value.trim();
-  if (!name) return showError('Enter your name first!');
-  myName = name;
+  if (!name) return showHomeErr('Enter your name first!');
+  myName = name; getAudio(); // unlock audio on first interaction
   try {
-    roomId = await createRoom();
-    isHost = true;
-    startListening();
-    enterLobby();
-  } catch(e) { showError(e.message); }
+    roomId = await createRoom(); isHost = true;
+    listen(); enterLobby();
+  } catch(e) { showHomeErr(e.message); }
 });
 
 $('join-room-btn').addEventListener('click', async () => {
   const name = $('username-input').value.trim();
   const code = $('room-code-input').value.trim().toUpperCase();
-  if (!name) return showError('Enter your name first!');
-  if (code.length < 3) return showError('Enter a room code!');
-  myName = name;
+  if (!name) return showHomeErr('Enter your name first!');
+  if (code.length < 3) return showHomeErr('Enter a room code!');
+  myName = name; getAudio();
   try {
-    await joinRoom(code, name);
-    roomId = code;
-    isHost = false;
-    startListening();
-    enterLobby();
-  } catch(e) { showError(e.message); }
+    await joinRoom(code, name); roomId = code; isHost = false;
+    listen(); enterLobby();
+  } catch(e) { showHomeErr(e.message); }
 });
 
-$('username-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') $('create-room-btn').click();
-});
-$('room-code-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') $('join-room-btn').click();
-  $('room-code-input').value = $('room-code-input').value.toUpperCase();
-});
-$('room-code-input').addEventListener('input', () => {
-  $('room-code-input').value = $('room-code-input').value.toUpperCase();
-});
+$('username-input').addEventListener('keydown', e => { if (e.key === 'Enter') $('create-room-btn').click(); });
+$('room-code-input').addEventListener('input',  () => { $('room-code-input').value = $('room-code-input').value.toUpperCase(); });
+$('room-code-input').addEventListener('keydown', e => { if (e.key === 'Enter') $('join-room-btn').click(); });
 
-function showError(msg) { $('home-error').textContent = msg; }
+function showHomeErr(msg) { $('home-error').textContent = msg; }
 
-// ── Lobby View ─────────────────────────────────────────────────────────────
+// ── Lobby ──────────────────────────────────────────────────────────────────
 function enterLobby() {
-  $('lobby-room-code').textContent = roomId;
-  $('game-room-code').textContent  = roomId;
+  $('lobby-code').textContent = roomId;
+  initBonusGrid();
   showView('lobby');
 }
 
-$('copy-code-btn').addEventListener('click', () => {
-  navigator.clipboard.writeText(roomId).catch(() => {});
-  $('copy-code-btn').textContent = '✓';
-  setTimeout(() => ($('copy-code-btn').textContent = '⎘'), 1500);
+$('copy-btn').addEventListener('click', () => {
+  navigator.clipboard.writeText(roomId).catch(()=>{});
+  $('copy-btn').textContent = '✓';
+  setTimeout(() => ($('copy-btn').textContent = '⎘'), 1500);
 });
 
-$('leave-lobby-btn').addEventListener('click', () => {
-  cleanup();
-  showView('home');
-});
+$('leave-btn').addEventListener('click', () => { cleanup(); showView('home'); });
 
-$('start-game-btn').addEventListener('click', async () => {
+$('start-btn').addEventListener('click', async () => {
   if (!isHost) return;
   const snap = await getDoc(roomRef(roomId));
   const room = snap.data();
-  const alivePlayers = Object.entries(room.players)
-    .filter(([,p]) => p.isAlive)
-    .sort((a,b) => a[1].order - b[1].order);
-  if (alivePlayers.length < 2) return alert('Need at least 2 players!');
-
-  const firstId = alivePlayers[0][0];
-  const prompt  = randomPrompt(1);
+  const alive = Object.entries(room.players).filter(([,p]) => p.isAlive).sort((a,b) => a[1].order - b[1].order);
+  if (alive.length < 2) return alert('Need at least 2 players to start!');
+  const s = room.settings || DEFAULT_SETTINGS;
+  const prompt = randomPrompt(s.difficulty, 1);
+  const resets = Object.fromEntries(alive.map(([id, p]) => [
+    `players.${id}`, { ...p, lives: s.startingLives, isAlive: true, wordCount: 0, longestWord: 0, lettersUsed: {}, bonusEarned: 0 }
+  ]));
   await updateDoc(roomRef(roomId), {
-    state: 'playing',
-    currentPlayerId: firstId,
-    prompt,
-    turnStartTime: Date.now(),
-    turnDuration: 10000,
-    usedWords: [],
-    round: 1,
-    winnerId: null,
-    // reset lives
-    ...Object.fromEntries(alivePlayers.map(([id, p]) => [
-      `players.${id}`, { ...p, lives: MAX_LIVES, isAlive: true }
-    ]))
+    state: 'playing', currentPlayerId: alive[0][0], prompt,
+    turnStartTime: Date.now(), turnDuration: s.minDuration * 1000,
+    usedWords: [], round: 1, winnerId: null, promptFailures: 0,
+    wordCount: 0, gameStartTime: Date.now(), lastWord: null, pendingWord: null,
+    ...resets,
   });
 });
 
-// ── Firestore Listener ─────────────────────────────────────────────────────
-function startListening() {
+// ── Settings UI (lobby) ────────────────────────────────────────────────────
+function linkSlider(numId, rangeId, key, transform) {
+  const n = $(numId), r = $(rangeId);
+  if (!n || !r) return;
+  function sync(src, dst, val) {
+    dst.value = val;
+    if (isHost) saveSettings(key, transform ? transform(val) : Number(val));
+  }
+  n.addEventListener('input', () => sync(n, r, n.value));
+  r.addEventListener('input', () => sync(r, n, r.value));
+}
+
+function saveSettings(key, val) {
+  if (!isHost || !roomId) return;
+  updateDoc(roomRef(roomId), { [`settings.${key}`]: val }).catch(() => {});
+}
+
+$('s-difficulty').addEventListener('change', () => { if (isHost) saveSettings('difficulty', $('s-difficulty').value); });
+$('s-dict').addEventListener('change', () => {});  // future use
+
+linkSlider('s-duration-n',    's-duration-r',    'minDuration',   Number);
+linkSlider('s-age-n',         's-age-r',         'maxPromptAge',  Number);
+linkSlider('s-lives-start-n', 's-lives-start-r', 'startingLives', Number);
+linkSlider('s-lives-max-n',   's-lives-max-r',   'maxLives',      Number);
+linkSlider('s-maxp-n',        's-maxp-r',        'maxPlayers',    Number);
+
+// Bonus alphabet grid
+function initBonusGrid() {
+  const grid = $('bonus-grid');
+  grid.innerHTML = '';
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').forEach(letter => {
+    const def = (letter === 'X' || letter === 'Z') ? 0 : 1;
+    const cell = document.createElement('div');
+    cell.className = 'bonus-cell';
+    cell.innerHTML = `<span class="bonus-letter">${letter}</span>
+      <input class="bonus-count" type="number" min="0" max="5" value="${def}" data-letter="${letter}">`;
+    grid.appendChild(cell);
+  });
+  grid.addEventListener('change', e => {
+    if (!isHost || !e.target.dataset.letter) return;
+    saveSettings(`bonusAlphabet.${e.target.dataset.letter}`, Number(e.target.value));
+  });
+}
+
+$('bonus-set-btn').addEventListener('click', () => {
+  const val = Number($('bonus-set-val').value);
+  document.querySelectorAll('.bonus-count').forEach(inp => {
+    inp.value = val;
+    if (isHost) saveSettings(`bonusAlphabet.${inp.dataset.letter}`, val);
+  });
+});
+
+function applySettingsToUI(s) {
+  if (!s) return;
+  const set = (id, val) => { const el = $(id); if (el) el.value = val; };
+  set('s-difficulty',    s.difficulty || 'beginner');
+  set('s-duration-n',   s.minDuration || 10); set('s-duration-r',    s.minDuration || 10);
+  set('s-age-n',        s.maxPromptAge || 2); set('s-age-r',         s.maxPromptAge || 2);
+  set('s-lives-start-n',s.startingLives||2); set('s-lives-start-r', s.startingLives||2);
+  set('s-lives-max-n',  s.maxLives || 3);    set('s-lives-max-r',   s.maxLives || 3);
+  set('s-maxp-n',       s.maxPlayers||16);   set('s-maxp-r',        s.maxPlayers||16);
+  if (s.bonusAlphabet) {
+    document.querySelectorAll('.bonus-count').forEach(inp => {
+      const v = s.bonusAlphabet[inp.dataset.letter];
+      if (v !== undefined) inp.value = v;
+    });
+  }
+  // readonly for non-host
+  const panel = $('settings-panel');
+  if (panel) panel.classList.toggle('readonly', !isHost);
+}
+
+// ── Firestore listener ─────────────────────────────────────────────────────
+function listen() {
   if (roomUnsub) roomUnsub();
   roomUnsub = onSnapshot(roomRef(roomId), snap => {
     if (!snap.exists()) return;
     lastRoom = snap.data();
-    handleRoomUpdate(lastRoom);
+    handleUpdate(lastRoom);
   });
 }
 
 function cleanup() {
   if (roomUnsub) { roomUnsub(); roomUnsub = null; }
-  if (timerLoop) { clearInterval(timerLoop); timerLoop = null; }
-  lastRoom = null;
+  stopTicking();
+  if (timerRAF) { cancelAnimationFrame(timerRAF); timerRAF = null; }
+  if (gameClockTO) { clearTimeout(gameClockTO); gameClockTO = null; }
+  lastRoom = null; submitting = false;
 }
 
-// ── Main Room Update Handler ───────────────────────────────────────────────
-function handleRoomUpdate(room) {
-  if (room.state === 'lobby') {
-    renderLobby(room);
-    return;
-  }
+// ── Main update handler ────────────────────────────────────────────────────
+function handleUpdate(room) {
+  if (room.state === 'lobby') { renderLobby(room); return; }
   if (room.state === 'playing') {
     if (!views.game.classList.contains('active')) showView('game');
     renderGame(room);
+    // Non-host watches for pending words
+    if (isHost && room.pendingWord) processPendingWord(room);
     return;
   }
-  if (room.state === 'gameOver') {
-    renderGameOver(room);
-    return;
-  }
+  if (room.state === 'gameOver') { renderGameOver(room); return; }
 }
 
-// ── Lobby Render ───────────────────────────────────────────────────────────
+// ── Lobby render ───────────────────────────────────────────────────────────
 function renderLobby(room) {
   const container = $('lobby-players');
   container.innerHTML = '';
-  const sorted = Object.entries(room.players).sort((a,b) => a[1].order - b[1].order);
-  for (const [id, p] of sorted) {
-    const card = document.createElement('div');
-    card.className = 'lobby-player-card';
+  Object.entries(room.players).sort((a,b) => a[1].order - b[1].order).forEach(([id, p]) => {
+    const div = document.createElement('div');
+    div.className = 'lobby-player-card';
     const initials = p.name.slice(0,2).toUpperCase();
     const color = avatarColor(p.name);
     let badge = '';
-    if (id === room.hostId) badge = '<span class="host-badge">HOST</span>';
-    else if (id === myId)   badge = '<span class="you-badge">YOU</span>';
-    card.innerHTML = `
-      <div class="avatar" style="background:${color}">${initials}</div>
-      <span>${escHtml(p.name)}</span>
-      ${badge}
-    `;
-    container.appendChild(card);
-  }
-  const startBtn = $('start-game-btn');
-  startBtn.style.display = (isHost && room.hostId === myId) ? 'block' : 'none';
+    if (id === room.hostId && id === myId) badge = '<span class="lp-badge host">HOST</span>';
+    else if (id === room.hostId)            badge = '<span class="lp-badge host">HOST</span>';
+    else if (id === myId)                   badge = '<span class="lp-badge you">YOU</span>';
+    div.innerHTML = `<div class="lp-avatar" style="background:${color}">${esc(initials)}</div>
+      <span>${esc(p.name)}</span>${badge}`;
+    container.appendChild(div);
+  });
+  $('start-btn').style.display = (isHost && room.hostId === myId) ? 'block' : 'none';
+  applySettingsToUI(room.settings || DEFAULT_SETTINGS);
 }
 
-// ── Game Render ────────────────────────────────────────────────────────────
+// ── Game render ────────────────────────────────────────────────────────────
 function renderGame(room) {
-  renderPlayers(room);
-  updatePrompt(room);
-  updateTurnLabel(room);
-  startCountdown(room);
-  $('topbar-round').textContent = `Round ${room.round}`;
+  const s = room.settings || DEFAULT_SETTINGS;
+  // Top bar
+  $('tb-room').textContent  = roomId;
+  $('tb-count').textContent = `${Object.keys(room.players).length} players`;
+  $('tb-words').textContent = `(${room.wordCount || 0} words)`;
+
+  // Settings toggle button wires once
+  $('tb-settings-toggle').onclick = () => {
+    const gs = $('game-settings');
+    gs.classList.toggle('hidden');
+    if (!gs.classList.contains('hidden')) renderGameSettings(s);
+  };
+
+  renderGameSettings(s);
+  renderArena(room, s);
+  renderLeaderboard(room, s);
+  updateBombAndInput(room, s);
+  runGameClock(room.gameStartTime);
 }
 
-function renderPlayers(room) {
-  const sidebar = $('players-sidebar');
-  sidebar.innerHTML = '';
-  const sorted = Object.entries(room.players).sort((a,b) => a[1].order - b[1].order);
-  for (const [id, p] of sorted) {
-    const card = document.createElement('div');
-    card.className = 'player-card' +
-      (id === room.currentPlayerId ? ' current-turn' : '') +
-      (!p.isAlive ? ' eliminated' : '');
-    const hearts = Array.from({length: MAX_LIVES}, (_, i) =>
-      `<span class="heart${i >= p.lives ? ' lost' : ''}">❤</span>`
-    ).join('');
-    card.innerHTML = `
-      <div class="player-name">${escHtml(p.name)}${id === myId ? '<span class="you-tag">(you)</span>' : ''}</div>
-      <div class="player-hearts">${hearts}</div>
-      <span class="player-turn-arrow">▶</span>
-    `;
-    sidebar.appendChild(card);
-  }
+function renderGameSettings(s) {
+  const el = $('gsettings-content');
+  if (!el) return;
+  el.innerHTML = [
+    ['Difficulty',    s.difficulty],
+    ['Min Duration',  `${s.minDuration}s`],
+    ['Prompt Age',    s.maxPromptAge + ' fails'],
+    ['Starting Lives',s.startingLives],
+    ['Max Lives',     s.maxLives],
+    ['Max Players',   s.maxPlayers],
+  ].map(([k,v]) => `<div class="gs-row"><span>${k}</span><span class="gs-val">${esc(String(v))}</span></div>`).join('');
 }
 
-function updatePrompt(room) {
-  $('prompt-letters').textContent = room.prompt || '– –';
-  if (room.lastWord) {
-    $('last-word-display').textContent = `✓ ${room.lastWord}`;
-  } else {
-    $('last-word-display').textContent = '';
-  }
-}
-
-function updateTurnLabel(room) {
-  const label = $('turn-label');
-  if (room.currentPlayerId === myId) {
-    label.textContent = '💣 Your turn!';
-    label.className = 'turn-label your-turn';
-    setWordInputState(true);
-    showFeedback('Type a word containing the letters above', 'info');
-  } else {
-    const name = room.players[room.currentPlayerId]?.name || '?';
-    label.innerHTML = `<strong>${escHtml(name)}</strong>'s turn`;
-    label.className = 'turn-label';
-    setWordInputState(false);
-    showFeedback('');
-  }
-}
-
-// ── Countdown Timer ────────────────────────────────────────────────────────
-function startCountdown(room) {
-  if (timerLoop) clearInterval(timerLoop);
-
-  const duration = room.turnDuration || 10000;
-  const startTime = room.turnStartTime;
-
+function runGameClock(startTime) {
+  if (!startTime) return;
+  if (gameClockTO) clearTimeout(gameClockTO);
   function tick() {
-    const elapsed = Date.now() - startTime;
-    const remaining = Math.max(0, duration - elapsed);
-    const secs = Math.ceil(remaining / 1000);
-
-    $('bomb-timer').textContent = secs;
-
-    const wrapper = $('bomb-wrapper');
-    const ratio = remaining / duration;
-    if (ratio < 0.25) {
-      wrapper.className = 'bomb-wrapper critical danger';
-    } else if (ratio < 0.5) {
-      wrapper.className = 'bomb-wrapper danger';
-    } else {
-      wrapper.className = 'bomb-wrapper';
-    }
-
-    // Host handles timeout
-    if (remaining <= 0 && isHost) {
-      clearInterval(timerLoop);
-      timerLoop = null;
-      handleTimeout(room);
-    }
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const m = String(Math.floor(elapsed / 60)).padStart(2,'0');
+    const sec = String(elapsed % 60).padStart(2,'0');
+    const el = $('tb-clock');
+    if (el) el.textContent = `${m}:${sec}`;
+    gameClockTO = setTimeout(tick, 1000);
   }
-
   tick();
-  timerLoop = setInterval(tick, 100);
 }
 
-async function handleTimeout(room) {
+// ── Leaderboard ────────────────────────────────────────────────────────────
+function renderLeaderboard(room, s) {
+  const tbody = $('lb-body');
+  if (!tbody) return;
+  const players = Object.entries(room.players).sort((a,b) => a[1].order - b[1].order);
+  const ba = (s.settings || s).bonusAlphabet || DEFAULT_SETTINGS.bonusAlphabet;
+  tbody.innerHTML = players.map(([id, p]) => {
+    const used   = p.lettersUsed || {};
+    const needed = Object.entries(ba).filter(([,v]) => v > 0).length;
+    const done   = Object.entries(ba).filter(([l,v]) => v > 0 && (used[l]||0) >= v).length;
+    const isCur  = id === room.currentPlayerId;
+    const isElim = !p.isAlive;
+    return `<tr class="${isCur ? 'lb-current' : ''} ${isElim ? 'lb-eliminated' : ''}">
+      <td class="lb-name">${esc(p.name)}${id === myId ? ' <span style="color:var(--accent);font-size:.65rem">(you)</span>' : ''}</td>
+      <td>${p.wordCount || 0}</td>
+      <td class="lb-alpha">${done}/${needed}</td>
+      <td>${p.bonusEarned || 0}</td>
+      <td>${p.longestWord || 0}</td>
+      <td class="lb-lives">${'❤'.repeat(Math.max(0, p.lives))}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Arena (circular layout) ────────────────────────────────────────────────
+let playerPositions = {};  // { id: {x, y} }
+
+function renderArena(room, s) {
+  const arena = $('arena');
+  const container = $('arena-players');
+  const sorted = Object.entries(room.players).sort((a,b) => a[1].order - b[1].order);
+  const n = sorted.length;
+  const rect  = arena.getBoundingClientRect();
+  const cx    = rect.width  / 2;
+  const cy    = rect.height / 2;
+  const rad   = Math.min(cx, cy) * 0.68;
+
+  // Build/update player nodes
+  sorted.forEach(([id, p], i) => {
+    const angle = (2 * Math.PI * i / n) - Math.PI / 2;
+    const x = cx + rad * Math.cos(angle);
+    const y = cy + rad * Math.sin(angle);
+    playerPositions[id] = { x, y };
+
+    let node = document.getElementById(`pnode-${id}`);
+    if (!node) {
+      node = document.createElement('div');
+      node.id = `pnode-${id}`;
+      node.className = 'pnode';
+      container.appendChild(node);
+    }
+
+    const isCurrent = id === room.currentPlayerId;
+    const color = avatarColor(p.name);
+    const maxL  = (s.settings || s).maxLives || DEFAULT_SETTINGS.maxLives;
+    const word  = id === room.currentPlayerId && id === myId
+      ? '' // self typing shown in word bar, not node
+      : (p.lastWord || '');
+
+    node.className = `pnode${isCurrent ? ' current-turn' : ''}${!p.isAlive ? ' eliminated' : ''}`;
+    node.style.left = `${x}px`;
+    node.style.top  = `${y}px`;
+    node.innerHTML  = `
+      <div class="pnode-name">
+        ${esc(p.name)}${id === myId ? '<span class="pnode-you">(you)</span>' : ''}
+        <span class="pnode-hearts">${hearts(p.lives, maxL)}</span>
+      </div>
+      <div class="pnode-avatar" style="background:${color}">${esc(p.name.slice(0,2).toUpperCase())}</div>
+      <div class="pnode-word" id="pword-${id}">${wordWithHighlight(word, room.prompt || '')}</div>
+    `;
+  });
+
+  // Remove nodes for players who left
+  container.querySelectorAll('.pnode').forEach(node => {
+    const id = node.id.replace('pnode-', '');
+    if (!room.players[id]) node.remove();
+  });
+
+  updateArrow(room.currentPlayerId);
+}
+
+function wordWithHighlight(word, prompt) {
+  if (!word || !prompt) return esc(word || '');
+  const w = word.toLowerCase(), p = prompt.toLowerCase();
+  const idx = w.indexOf(p);
+  if (idx === -1) return esc(word);
+  return `${esc(word.slice(0,idx))}<span class="wm">${esc(word.slice(idx, idx+p.length))}</span>${esc(word.slice(idx+p.length))}`;
+}
+
+// Update SVG arrow from bomb center to current player
+function updateArrow(currentPlayerId) {
+  const line = $('arrow-line');
+  if (!line || !currentPlayerId) { if (line) line.setAttribute('x2', line.getAttribute('x1')); return; }
+
+  const arena  = $('arena');
+  const rect   = arena.getBoundingClientRect();
+  const cx = rect.width / 2, cy = rect.height / 2;
+  const pos = playerPositions[currentPlayerId];
+  if (!pos) return;
+
+  const dx = pos.x - cx, dy = pos.y - cy;
+  const len = Math.sqrt(dx*dx + dy*dy) || 1;
+  const bombR  = 68, playerR = 36;
+  const x1 = cx + dx/len * bombR,  y1 = cy + dy/len * bombR;
+  const x2 = pos.x - dx/len * playerR, y2 = pos.y - dy/len * playerR;
+
+  line.setAttribute('x1', x1); line.setAttribute('y1', y1);
+  line.setAttribute('x2', x2); line.setAttribute('y2', y2);
+}
+
+// Re-layout on window resize
+window.addEventListener('resize', () => { if (lastRoom && lastRoom.state === 'playing') renderArena(lastRoom, lastRoom.settings || DEFAULT_SETTINGS); });
+
+// ── Bomb display + input ───────────────────────────────────────────────────
+let lastTurnStart = null;
+
+function updateBombAndInput(room, s) {
+  $('bomb-prompt').textContent = room.prompt || '–';
+
+  const isMyTurn = room.currentPlayerId === myId;
+  const inp = $('word-input');
+  if (isMyTurn && inp.disabled) { inp.disabled = false; inp.value = ''; inp.focus(); }
+  else if (!isMyTurn && !inp.disabled) { inp.disabled = true; inp.value = ''; }
+
+  // Update word display
+  updateWordDisplay(inp.value, room.prompt || '');
+
+  // Turn status label (shown in word-feedback when not your turn)
+  const fb = $('word-feedback');
+  if (!isMyTurn) {
+    const cur = room.players[room.currentPlayerId];
+    fb.className = 'word-feedback';
+    fb.textContent = cur ? `${cur.name}'s turn` : '';
+  }
+
+  // Countdown
+  if (room.turnStartTime && room.turnDuration) {
+    if (lastTurnStart !== room.turnStartTime) {
+      lastTurnStart = room.turnStartTime;
+      startTicking(room.turnStartTime, room.turnDuration);
+    }
+    runCountdown(room.turnStartTime, room.turnDuration, room, s);
+  }
+}
+
+function runCountdown(startTime, duration, room, s) {
+  if (timerRAF) cancelAnimationFrame(timerRAF);
+  const bomb = $('bomb');
+  const secsEl = $('bomb-secs');
+
+  function frame() {
+    const remaining = Math.max(0, duration - (Date.now() - startTime));
+    const secs = Math.ceil(remaining / 1000);
+    if (secsEl) secsEl.textContent = secs;
+
+    const ratio = remaining / duration;
+    if (bomb) {
+      bomb.className = 'bomb' +
+        (ratio < 0.25 ? ' danger critical' : ratio < 0.5 ? ' danger' : '');
+    }
+
+    if (remaining > 0) {
+      timerRAF = requestAnimationFrame(frame);
+    } else {
+      stopTicking();
+      if (isHost) handleTimeout(room, s);
+    }
+  }
+  frame();
+}
+
+// ── Turn timeout (host only) ───────────────────────────────────────────────
+async function handleTimeout(room, s) {
   if (!isHost) return;
   const playerId = room.currentPlayerId;
   const player   = room.players[playerId];
   if (!player || !player.isAlive) return;
 
-  const newLives = player.lives - 1;
-  const isAlive  = newLives > 0;
+  playExplosion();
+
+  const settings = s || room.settings || DEFAULT_SETTINGS;
+  const newLives  = player.lives - 1;
+  const stillAlive = newLives > 0;
+  const newPromptAge = (room.promptFailures || 0) + 1;
+  const promptExpired = newPromptAge >= (settings.maxPromptAge || 2);
 
   const updatedPlayers = {
     ...room.players,
-    [playerId]: { ...player, lives: newLives, isAlive }
+    [playerId]: { ...player, lives: newLives, isAlive: stillAlive }
   };
 
-  // Count alive players
   const alivePlayers = Object.entries(updatedPlayers)
-    .filter(([, p]) => p.isAlive)
+    .filter(([,p]) => p.isAlive)
     .sort((a,b) => a[1].order - b[1].order);
 
   if (alivePlayers.length <= 1) {
-    // Game over
-    const winnerId = alivePlayers[0]?.[0] || null;
     await updateDoc(roomRef(roomId), {
-      state: 'gameOver',
-      winnerId,
-      players: updatedPlayers,
-      currentPlayerId: null,
+      state: 'gameOver', winnerId: alivePlayers[0]?.[0] || null,
+      players: updatedPlayers, currentPlayerId: null,
     });
     return;
   }
 
-  // Advance to next living player
-  const currentIndex = alivePlayers.findIndex(([id]) => id !== playerId ||
-    (id === playerId && !isAlive) ? true : false);
-
-  // Find next alive player after current
-  const allSorted = Object.entries(updatedPlayers).sort((a,b) => a[1].order - b[1].order);
-  const curPos = allSorted.findIndex(([id]) => id === playerId);
-  let nextId = null;
-  for (let i = 1; i <= allSorted.length; i++) {
-    const [nid, np] = allSorted[(curPos + i) % allSorted.length];
-    if (np.isAlive) { nextId = nid; break; }
-  }
-
-  const newRound = room.round + (nextId === alivePlayers[0][0] ? 1 : 0);
-  const newDuration = Math.max(5000, room.turnDuration - 200);
-  const newPrompt = randomPrompt(newRound);
+  const nextId   = nextAlivePlayer(updatedPlayers, playerId);
+  const newRound = isWrapping(updatedPlayers, playerId, nextId) ? room.round + 1 : room.round;
+  const newDur   = Math.max(settings.minDuration * 1000, room.turnDuration - 500);
+  const newPrompt = promptExpired
+    ? randomPrompt(settings.difficulty, newRound)
+    : room.prompt;
 
   await updateDoc(roomRef(roomId), {
-    players: updatedPlayers,
-    currentPlayerId: nextId,
-    prompt: newPrompt,
-    turnStartTime: Date.now(),
-    turnDuration: newDuration,
-    round: newRound,
-    lastWord: null,
+    players: updatedPlayers, currentPlayerId: nextId,
+    prompt: newPrompt, turnStartTime: Date.now(), turnDuration: newDur,
+    round: newRound, lastWord: null, pendingWord: null,
+    promptFailures: promptExpired ? 0 : newPromptAge,
   });
 }
 
-// ── Word Submission ────────────────────────────────────────────────────────
+// ── Word submission ────────────────────────────────────────────────────────
+$('word-input').addEventListener('input', () => {
+  const inp = $('word-input');
+  updateWordDisplay(inp.value, lastRoom?.prompt || '');
+  // also update own pnode word in real-time
+  const pword = $(`pword-${myId}`);
+  if (pword) pword.innerHTML = wordWithHighlight(inp.value, lastRoom?.prompt || '');
+});
+
 $('word-input').addEventListener('keydown', async e => {
-  if (e.key !== 'Enter') return;
-  if (submitting) return;
-
+  if (e.key !== 'Enter' || submitting) return;
   const word = $('word-input').value.trim().toLowerCase();
-  if (!word) return;
+  if (!word || !lastRoom || lastRoom.currentPlayerId !== myId) return;
 
-  if (!lastRoom) return;
-  if (lastRoom.currentPlayerId !== myId) return;
+  const prompt = (lastRoom.prompt || '').toLowerCase();
+  if (!word.includes(prompt)) return flashFeedback(`Must contain "${prompt.toUpperCase()}"`, 'err');
+  if ((lastRoom.usedWords || []).includes(word)) return flashFeedback('Word already used!', 'err');
 
-  const prompt = lastRoom.prompt.toLowerCase();
-
-  // 1. Check prompt is in word
-  if (!word.includes(prompt)) {
-    flashError(`Word must contain "${lastRoom.prompt.toUpperCase()}"`);
-    return;
-  }
-
-  // 2. Check not already used
-  if ((lastRoom.usedWords || []).includes(word)) {
-    flashError('Word already used this game!');
-    return;
-  }
-
-  // 3. Validate English
   submitting = true;
-  showFeedback('Checking…', 'info');
+  $('word-feedback').className = 'word-feedback';
+  $('word-feedback').textContent = 'Checking…';
   $('word-input').disabled = true;
 
   const valid = await isValidWord(word);
   if (!valid) {
     submitting = false;
-    flashError('Not a valid English word!');
-    setWordInputState(true);
+    flashFeedback('Not a valid English word!', 'err');
+    $('word-input').disabled = false;
+    $('word-input').classList.add('shake');
+    setTimeout(() => $('word-input').classList.remove('shake'), 350);
+    $('word-input').focus();
     return;
   }
 
-  // 4. Submit — advance turn
-  if (!isHost) {
-    // Non-host marks word as used; host advances turn
-    await updateDoc(roomRef(roomId), {
-      pendingWord: { word, playerId: myId, ts: Date.now() }
-    });
-  } else {
+  // Submit
+  if (isHost) {
     await advanceTurn(word, lastRoom);
+  } else {
+    await updateDoc(roomRef(roomId), { pendingWord: { word, playerId: myId, ts: Date.now() } });
   }
   submitting = false;
 });
 
-// ── Advance Turn (host only) ───────────────────────────────────────────────
+function updateWordDisplay(typed, prompt) {
+  const el = $('word-display');
+  if (!el) return;
+  if (!typed) { el.innerHTML = ''; return; }
+  el.innerHTML = wordWithHighlight(typed, prompt);
+}
+
+function flashFeedback(msg, cls) {
+  const fb = $('word-feedback');
+  fb.textContent = msg; fb.className = `word-feedback ${cls}`;
+  setTimeout(() => { if (fb.textContent === msg) { fb.textContent = ''; fb.className = 'word-feedback'; } }, 2500);
+}
+
+// ── Advance turn (host) ────────────────────────────────────────────────────
 async function advanceTurn(word, room) {
-  if (timerLoop) { clearInterval(timerLoop); timerLoop = null; }
+  stopTicking();
+  const s = room.settings || DEFAULT_SETTINGS;
+  const curId   = room.currentPlayerId;
+  const player  = room.players[curId];
+  if (!player) return;
 
-  const currentId = room.currentPlayerId;
-  const allSorted = Object.entries(room.players).sort((a,b) => a[1].order - b[1].order);
-  const curPos    = allSorted.findIndex(([id]) => id === currentId);
+  // Bonus alphabet tracking
+  const lettersUsed = { ...(player.lettersUsed || {}) };
+  const ba = s.bonusAlphabet || DEFAULT_SETTINGS.bonusAlphabet;
+  const uniqueLetters = [...new Set(word.toUpperCase())];
+  uniqueLetters.forEach(l => { lettersUsed[l] = (lettersUsed[l] || 0) + 1; });
 
-  let nextId = null;
-  for (let i = 1; i <= allSorted.length; i++) {
-    const [nid, np] = allSorted[(curPos + i) % allSorted.length];
-    if (np.isAlive) { nextId = nid; break; }
+  // Check if bonus earned
+  const allDone = Object.entries(ba).every(([l, req]) => req === 0 || (lettersUsed[l] || 0) >= req);
+  let newLives = player.lives;
+  let bonusEarned = player.bonusEarned || 0;
+  if (allDone) {
+    const maxL = s.maxLives || DEFAULT_SETTINGS.maxLives;
+    if (newLives < maxL) { newLives++; bonusEarned++; playBonusLife(); }
+    // Reset tracking
+    Object.keys(lettersUsed).forEach(k => { lettersUsed[k] = 0; });
   }
 
-  // Did we wrap around? → new round
-  const nextPos = allSorted.findIndex(([id]) => id === nextId);
-  const newRound = nextPos <= curPos ? room.round + 1 : room.round;
-  const newDuration = Math.max(5000, room.turnDuration - (nextPos <= curPos ? 300 : 0));
-  const newPrompt   = randomPrompt(newRound);
+  const updPlayers = {
+    ...room.players,
+    [curId]: {
+      ...player, lives: newLives, lettersUsed, bonusEarned,
+      wordCount: (player.wordCount || 0) + 1,
+      lastWord: word,
+      longestWord: Math.max(player.longestWord || 0, word.length),
+    }
+  };
+
+  const nextId = nextAlivePlayer(updPlayers, curId);
+  const wrapping = isWrapping(updPlayers, curId, nextId);
+  const newRound = wrapping ? room.round + 1 : room.round;
+  const newDur   = Math.max(s.minDuration * 1000, room.turnDuration - (wrapping ? 400 : 0));
+  const newPrompt = randomPrompt(s.difficulty, newRound);
 
   await updateDoc(roomRef(roomId), {
-    currentPlayerId: nextId,
-    prompt: newPrompt,
-    turnStartTime: Date.now(),
-    turnDuration: newDuration,
-    round: newRound,
-    lastWord: word,
-    usedWords: arrayUnion(word),
-    pendingWord: null,
+    players: updPlayers, currentPlayerId: nextId,
+    prompt: newPrompt, turnStartTime: Date.now(), turnDuration: newDur,
+    round: newRound, lastWord: word, wordCount: (room.wordCount || 0) + 1,
+    usedWords: arrayUnion(word), pendingWord: null, promptFailures: 0,
   });
 }
 
-// Watch for non-host word submissions and process them (host only)
-let lastPendingWord = null;
-function watchPendingWord(room) {
-  if (!isHost) return;
-  if (!room.pendingWord) return;
+async function processPendingWord(room) {
   const pw = room.pendingWord;
-  if (!pw || pw === lastPendingWord) return;
-  if (pw.playerId !== room.currentPlayerId) return;
-  lastPendingWord = pw;
-  advanceTurn(pw.word, room);
+  if (!pw || pw.playerId !== room.currentPlayerId) return;
+  await advanceTurn(pw.word, room);
 }
 
-// Hook into room update
-const _origHandle = handleRoomUpdate;
-// Extend handleRoomUpdate to also watch pending words
-function handleRoomUpdateExtended(room) {
-  watchPendingWord(room);
-  _origHandle(room);
-}
-// Replace the listener ref
-setTimeout(() => {
-  if (roomUnsub) roomUnsub();
-  if (roomId) {
-    roomUnsub = onSnapshot(roomRef(roomId), snap => {
-      if (!snap.exists()) return;
-      lastRoom = snap.data();
-      handleRoomUpdateExtended(lastRoom);
-    });
+// ── Turn helpers ───────────────────────────────────────────────────────────
+function nextAlivePlayer(players, currentId) {
+  const sorted = Object.entries(players).sort((a,b) => a[1].order - b[1].order);
+  const curPos = sorted.findIndex(([id]) => id === currentId);
+  for (let i = 1; i <= sorted.length; i++) {
+    const [nid, np] = sorted[(curPos + i) % sorted.length];
+    if (np.isAlive) return nid;
   }
-}, 0);
+  return null;
+}
 
-function flashError(msg) {
-  showFeedback(msg, 'error');
-  const inp = $('word-input');
-  inp.classList.add('error');
-  inp.disabled = false;
-  inp.select();
-  setTimeout(() => inp.classList.remove('error'), 500);
+function isWrapping(players, fromId, toId) {
+  const sorted = Object.entries(players).sort((a,b) => a[1].order - b[1].order);
+  const fromPos = sorted.findIndex(([id]) => id === fromId);
+  const toPos   = sorted.findIndex(([id]) => id === toId);
+  return toPos <= fromPos;
 }
 
 // ── Game Over ──────────────────────────────────────────────────────────────
 function renderGameOver(room) {
-  if (timerLoop) { clearInterval(timerLoop); timerLoop = null; }
+  stopTicking();
+  if (timerRAF) { cancelAnimationFrame(timerRAF); timerRAF = null; }
   const winner = room.players[room.winnerId];
-  $('gameover-winner').textContent = winner
+  $('go-winner').textContent = winner
     ? (room.winnerId === myId ? '🎉 You win!' : `🏆 ${winner.name} wins!`)
     : 'Nobody survived!';
   $('play-again-btn').style.display = (isHost && room.hostId === myId) ? 'block' : 'none';
@@ -525,31 +780,17 @@ $('play-again-btn').addEventListener('click', async () => {
   if (!isHost) return;
   const snap = await getDoc(roomRef(roomId));
   const room = snap.data();
+  const s = room.settings || DEFAULT_SETTINGS;
   const sorted = Object.entries(room.players).sort((a,b) => a[1].order - b[1].order);
-  const firstId = sorted[0][0];
   await updateDoc(roomRef(roomId), {
-    state: 'lobby',
-    currentPlayerId: null,
-    prompt: null,
-    turnStartTime: null,
-    usedWords: [],
-    round: 1,
-    winnerId: null,
-    lastWord: null,
-    pendingWord: null,
+    state: 'lobby', currentPlayerId: null, prompt: null, turnStartTime: null,
+    usedWords: [], round: 1, winnerId: null, lastWord: null, pendingWord: null,
+    wordCount: 0, gameStartTime: null, promptFailures: 0,
     ...Object.fromEntries(sorted.map(([id, p]) => [
-      `players.${id}`, { ...p, lives: MAX_LIVES, isAlive: true }
+      `players.${id}`, { ...p, lives: s.startingLives, isAlive: true, wordCount: 0, longestWord: 0, lettersUsed: {}, bonusEarned: 0 }
     ]))
   });
   enterLobby();
 });
 
-$('home-btn').addEventListener('click', () => {
-  cleanup();
-  showView('home');
-});
-
-// ── Utils ──────────────────────────────────────────────────────────────────
-function escHtml(str) {
-  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
+$('home-btn').addEventListener('click', () => { cleanup(); showView('home'); });

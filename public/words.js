@@ -282,14 +282,28 @@ export async function isValidWord(word) {
   }
 }
 
-/** Pick a random prompt, weighted toward easier ones in early rounds */
-export function randomPrompt(round = 1) {
-  // Rounds 1-2: use first ~40 (easy 2-letter)
-  // Rounds 3-4: mix in 3-letter
-  // Round 5+: full pool
+/**
+ * Pick a random prompt based on difficulty setting + round.
+ * difficulty: 'beginner' | 'normal' | 'hard' | 'insane'
+ */
+export function randomPrompt(difficulty = 'beginner', round = 1) {
+  // PROMPTS is ordered easiest → hardest (by how many common words contain them)
+  // beginner: easy 2-letter combos only
+  // normal:   2-letter + common 3-letter
+  // hard:     full set including rare 3-letter
+  // insane:   full set including tough combos
   let pool;
-  if (round <= 2)      pool = PROMPTS.slice(0, 40);
-  else if (round <= 4) pool = PROMPTS.slice(0, 80);
-  else                 pool = PROMPTS;
+  switch (difficulty) {
+    case 'insane': pool = PROMPTS;                  break;
+    case 'hard':   pool = PROMPTS.slice(0, 110);    break;
+    case 'normal': pool = PROMPTS.slice(0, 80);     break;
+    case 'beginner':
+    default:
+      // In early rounds stay very easy; open up a little each round
+      if (round <= 2)      pool = PROMPTS.slice(0, 40);
+      else if (round <= 5) pool = PROMPTS.slice(0, 60);
+      else                 pool = PROMPTS.slice(0, 80);
+      break;
+  }
   return pool[Math.floor(Math.random() * pool.length)];
 }

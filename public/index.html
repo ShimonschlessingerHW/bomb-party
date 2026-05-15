@@ -5,116 +5,213 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Bomb Party</title>
   <link rel="stylesheet" href="style.css">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;900&display=swap" rel="stylesheet">
 </head>
 <body>
 
-  <!-- ── HOME VIEW ── -->
-  <div id="view-home" class="view active">
-    <div class="home-container">
-      <div class="logo-area">
-        <div class="logo-bomb">💣</div>
-        <h1 class="logo-title">BOMB PARTY</h1>
-        <p class="logo-sub">Type a word containing the letters before the bomb explodes!</p>
+<!-- ── HOME ── -->
+<div id="view-home" class="view active">
+  <div class="home-wrap">
+    <div class="home-logo">💣</div>
+    <h1 class="home-title">BOMB PARTY</h1>
+    <p class="home-sub">Type a word containing the letters before the bomb explodes!</p>
+    <div class="home-card">
+      <input id="username-input" class="inp" type="text" placeholder="Your name" maxlength="20" autocomplete="off">
+      <button id="create-room-btn" class="btn btn-green">Create Room</button>
+      <div class="home-or"><span>or join</span></div>
+      <div class="home-join">
+        <input id="room-code-input" class="inp code-inp" type="text" placeholder="ROOM" maxlength="4" autocomplete="off">
+        <button id="join-room-btn" class="btn btn-gray">Join</button>
       </div>
-      <div class="home-card">
-        <input type="text" id="username-input" class="text-input" placeholder="Your name" maxlength="20" autocomplete="off">
-        <div class="home-actions">
-          <button id="create-room-btn" class="btn btn-primary">Create Room</button>
-          <div class="divider"><span>or</span></div>
-          <div class="join-row">
-            <input type="text" id="room-code-input" class="text-input code-input" placeholder="ROOM" maxlength="4" autocomplete="off">
-            <button id="join-room-btn" class="btn btn-secondary">Join</button>
+      <p id="home-error" class="err"></p>
+    </div>
+  </div>
+</div>
+
+<!-- ── LOBBY ── -->
+<div id="view-lobby" class="view">
+  <div class="lobby-wrap">
+    <div class="lobby-left">
+      <div class="lobby-header">
+        <span class="lobby-title">Waiting Room</span>
+        <div class="lobby-code-box">
+          <span class="lobby-code-label">Room Code</span>
+          <span id="lobby-code" class="lobby-code-val"></span>
+          <button id="copy-btn" class="copy-btn" title="Copy">⎘</button>
+        </div>
+      </div>
+      <p class="lobby-hint">Share the code with your classmates!</p>
+      <div id="lobby-players" class="lobby-players"></div>
+      <div class="lobby-actions">
+        <button id="start-btn" class="btn btn-green" style="display:none">▶ Start Game</button>
+        <button id="leave-btn" class="btn btn-ghost">← Leave</button>
+      </div>
+    </div>
+
+    <div class="lobby-right">
+      <div id="settings-panel" class="settings-panel">
+        <h3 class="settings-title">⚙ Game Settings</h3>
+
+        <div class="sgroup">
+          <label class="slabel">📖 Dictionary</label>
+          <select id="s-dict" class="sinp sselect"><option value="en">English</option></select>
+        </div>
+
+        <div class="sgroup">
+          <label class="slabel">💪 Prompt Difficulty</label>
+          <p class="sdesc">How common should the syllable prompts be.</p>
+          <select id="s-difficulty" class="sinp sselect">
+            <option value="beginner">Beginner (at least 500 words per prompt)</option>
+            <option value="normal">Normal (at least 100 words per prompt)</option>
+            <option value="hard">Hard (at least 50 words per prompt)</option>
+            <option value="insane">Insane (at least 10 words per prompt)</option>
+          </select>
+        </div>
+
+        <div class="sgroup">
+          <label class="slabel">⏱ Minimum turn duration (seconds)</label>
+          <p class="sdesc">Bomb lasts at least this long for each player.</p>
+          <div class="slider-row">
+            <input id="s-duration-n" class="snumber" type="number" value="5" min="3" max="30">
+            <input id="s-duration-r" class="sslider" type="range" min="3" max="30" value="5">
           </div>
         </div>
-        <p id="home-error" class="error-text"></p>
-      </div>
-    </div>
-  </div>
 
-  <!-- ── LOBBY VIEW ── -->
-  <div id="view-lobby" class="view">
-    <div class="lobby-container">
-      <div class="lobby-header">
-        <h2>Waiting Room</h2>
-        <div class="room-code-badge">
-          <span class="room-code-label">Room Code</span>
-          <span class="room-code-value" id="lobby-room-code"></span>
-          <button class="copy-btn" id="copy-code-btn" title="Copy code">⎘</button>
-        </div>
-      </div>
-      <p class="lobby-hint">Share the room code with your friends!</p>
-      <div class="lobby-players" id="lobby-players"></div>
-      <div class="lobby-actions">
-        <button id="start-game-btn" class="btn btn-primary" style="display:none">▶ Start Game</button>
-        <button id="leave-lobby-btn" class="btn btn-ghost">← Leave</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- ── GAME VIEW ── -->
-  <div id="view-game" class="view">
-    <div class="game-layout">
-
-      <!-- Left: Player List -->
-      <aside class="players-sidebar" id="players-sidebar"></aside>
-
-      <!-- Center: Game Area -->
-      <main class="game-center">
-        <div class="game-topbar">
-          <span class="topbar-room">💣 <strong id="game-room-code"></strong></span>
-          <span class="topbar-round" id="topbar-round">Round 1</span>
+        <div class="sgroup">
+          <label class="slabel">🔁 Maximum prompt age (turns)</label>
+          <p class="sdesc">If this many players fail, the prompt changes.</p>
+          <div class="slider-row">
+            <input id="s-age-n" class="snumber" type="number" value="2" min="1" max="10">
+            <input id="s-age-r" class="sslider" type="range" min="1" max="10" value="2">
+          </div>
         </div>
 
-        <!-- Bomb -->
-        <div class="bomb-area">
-          <div class="bomb-wrapper" id="bomb-wrapper">
-            <svg class="fuse-svg" viewBox="0 0 60 50" xmlns="http://www.w3.org/2000/svg">
-              <path class="fuse-path" d="M30 10 Q45 5 40 0" stroke="#c8a04a" stroke-width="3" fill="none" stroke-linecap="round"/>
-              <circle class="fuse-spark" cx="40" cy="0" r="3" fill="#ff6a00"/>
-            </svg>
-            <div class="bomb-body">
-              <div class="bomb-timer" id="bomb-timer">10</div>
+        <div class="sgroup">
+          <label class="slabel">❤ Lives</label>
+          <div class="lives-rows">
+            <div class="lives-row">
+              <span>Starting:</span>
+              <input id="s-lives-start-n" class="snumber" type="number" value="2" min="1" max="5">
+              <input id="s-lives-start-r" class="sslider" type="range" min="1" max="5" value="2">
+            </div>
+            <div class="lives-row">
+              <span>Max:</span>
+              <input id="s-lives-max-n" class="snumber" type="number" value="3" min="1" max="5">
+              <input id="s-lives-max-r" class="sslider" type="range" min="1" max="5" value="3">
             </div>
           </div>
         </div>
 
-        <!-- Prompt & Status -->
-        <div class="prompt-section">
-          <div class="turn-label" id="turn-label">Waiting for game to start…</div>
-          <div class="prompt-display" id="prompt-display">
-            <span class="prompt-letters" id="prompt-letters">– –</span>
+        <div class="sgroup">
+          <label class="slabel">👥 Maximum players</label>
+          <p class="sdesc">The amount of players that can join the game.</p>
+          <div class="slider-row">
+            <input id="s-maxp-n" class="snumber" type="number" value="16" min="2" max="16">
+            <input id="s-maxp-r" class="sslider" type="range" min="2" max="16" value="16">
           </div>
-          <div class="last-word-display" id="last-word-display"></div>
         </div>
 
-        <!-- Word Input -->
-        <div class="input-section">
-          <div class="word-input-wrap">
-            <input type="text" id="word-input" class="word-input" placeholder="type a word…"
-                   autocomplete="off" spellcheck="false" autocorrect="off" disabled>
+        <div class="sgroup">
+          <label class="slabel">🔡 Bonus Alphabet</label>
+          <div id="bonus-grid" class="bonus-grid"></div>
+          <div class="bonus-footer">
+            Set all to: <input id="bonus-set-val" class="snumber" type="number" value="0" min="0" max="5">
+            <button id="bonus-set-btn" class="btn btn-xs">Set</button>
           </div>
-          <div class="input-feedback" id="input-feedback"></div>
         </div>
-      </main>
-
-    </div>
-  </div>
-
-  <!-- ── GAME OVER VIEW ── -->
-  <div id="view-gameover" class="view">
-    <div class="gameover-container">
-      <div class="gameover-boom">💥</div>
-      <h1 class="gameover-title">Game Over!</h1>
-      <p class="gameover-winner" id="gameover-winner"></p>
-      <div class="gameover-actions">
-        <button id="play-again-btn" class="btn btn-primary" style="display:none">Play Again</button>
-        <button id="home-btn" class="btn btn-ghost">Home</button>
       </div>
     </div>
   </div>
+</div>
 
-  <script type="module" src="game.js"></script>
+<!-- ── GAME ── -->
+<div id="view-game" class="view">
+  <div class="topbar">
+    <div class="tb-left">
+      <span class="tb-room" id="tb-room"></span>
+      <span class="tb-count" id="tb-count"></span>
+    </div>
+    <div class="tb-center">
+      <span class="tb-clock" id="tb-clock">00:00</span>
+      <span class="tb-words" id="tb-words">(0 words)</span>
+    </div>
+    <div class="tb-right">
+      <button class="tb-icon-btn" id="tb-settings-toggle" title="Settings">⚙</button>
+    </div>
+  </div>
+
+  <div class="game-body">
+    <!-- Arena -->
+    <div class="arena" id="arena">
+      <svg class="arena-svg" id="arena-svg" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#f5c500"/>
+          </marker>
+        </defs>
+        <line id="arrow-line" stroke="#f5c500" stroke-width="5"
+              stroke-linecap="round" marker-end="url(#arrowhead)"
+              x1="0" y1="0" x2="0" y2="0"/>
+      </svg>
+
+      <div class="bomb" id="bomb">
+        <div class="bomb-fuse">
+          <svg width="36" height="44" viewBox="0 0 36 44">
+            <path d="M18 44 Q28 30 32 8" stroke="#c8a04a" stroke-width="3" fill="none" stroke-linecap="round"/>
+            <circle class="fuse-spark" cx="32" cy="8" r="4" fill="#ff8800"/>
+          </svg>
+        </div>
+        <div class="bomb-sphere" id="bomb-sphere">
+          <div class="bomb-prompt" id="bomb-prompt">–</div>
+          <div class="bomb-secs" id="bomb-secs">10</div>
+        </div>
+      </div>
+
+      <div id="arena-players"></div>
+    </div>
+
+    <!-- Right panel -->
+    <aside class="right-panel" id="right-panel">
+      <table class="lb-table">
+        <thead>
+          <tr>
+            <th>Username</th><th>Words</th><th>Alpha</th>
+            <th>HP</th><th>Long</th><th>Lives</th>
+          </tr>
+        </thead>
+        <tbody id="lb-body"></tbody>
+      </table>
+      <div id="game-settings" class="game-settings hidden">
+        <h3 class="settings-title">⚙ Settings</h3>
+        <div id="gsettings-content" class="gsettings-content"></div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Word input bar -->
+  <div class="word-bar">
+    <div class="word-display" id="word-display"></div>
+    <input id="word-input" class="word-inp" type="text"
+           placeholder="type a word containing the letters above…"
+           autocomplete="off" spellcheck="false"
+           autocorrect="off" autocapitalize="off" disabled>
+    <div class="word-feedback" id="word-feedback"></div>
+  </div>
+</div>
+
+<!-- ── GAME OVER ── -->
+<div id="view-gameover" class="view">
+  <div class="gameover-wrap">
+    <div class="go-boom">💥</div>
+    <h1 class="go-title">Game Over!</h1>
+    <p id="go-winner" class="go-winner"></p>
+    <div class="go-btns">
+      <button id="play-again-btn" class="btn btn-green" style="display:none">Play Again</button>
+      <button id="home-btn" class="btn btn-ghost">Home</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="game.js"></script>
 </body>
 </html>
