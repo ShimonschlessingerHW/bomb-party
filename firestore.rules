@@ -1,0 +1,9 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Game rooms: anyone can read/write (class-only use, no auth needed)
+    match /rooms/{roomId} {
+      allow read, write: if true;
+    }
+  }
+}
