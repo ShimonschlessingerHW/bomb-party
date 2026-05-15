@@ -17,7 +17,10 @@
     <p class="home-sub">Type a word containing the letters before the bomb explodes!</p>
 
     <div class="home-card">
-      <input id="username-input" class="inp" type="text" placeholder="Your name" maxlength="20" autocomplete="off">
+      <div class="name-row">
+        <input id="username-input" class="inp" type="text" placeholder="Your name (or hit 🎲 for a random one)" maxlength="30" autocomplete="off">
+        <button id="random-name-btn" class="btn-rand" title="Random name">🎲</button>
+      </div>
       <button id="create-room-btn" class="btn btn-green">Create Public Room</button>
 
       <div class="home-section-label">Active Lobbies</div>
@@ -147,6 +150,8 @@
       <span class="tb-words" id="tb-words">(0 words)</span>
     </div>
     <div class="tb-right">
+      <span class="tb-myname" id="tb-myname"></span>
+      <button class="tb-icon-btn" id="edit-name-btn" title="Edit your name">✎</button>
       <button class="tb-icon-btn" id="tb-settings-toggle" title="Settings">⚙</button>
     </div>
   </div>

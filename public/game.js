@@ -39,8 +39,27 @@ const DEFAULT_SETTINGS = {
 };
 
 // ── DOM helpers ────────────────────────────────────────────────────────────
-const $ = id => document.getElementById(id);
+// Null-safe wrapper: if the element doesn't exist, return a no-op proxy
+// so missing DOM (cached HTML, typos) never crashes the script.
+const NULL_EL = new Proxy(function(){}, {
+  get(_, prop) {
+    if (prop === 'style' || prop === 'classList' || prop === 'dataset') return NULL_EL;
+    if (prop === 'value' || prop === 'textContent' || prop === 'innerHTML' || prop === 'checked') return '';
+    return () => {};
+  },
+  set() { return true; },
+  apply() { return undefined; },
+});
+const $ = id => document.getElementById(id) || NULL_EL;
 const views = { home: $('view-home'), lobby: $('view-lobby'), game: $('view-game'), gameover: $('view-gameover') };
+
+// ── Random name generator ─────────────────────────────────────────────────
+const NAME_ADJS  = ['Speedy','Wild','Sharp','Brave','Witty','Sneaky','Lucky','Cosmic','Magic','Sparkly','Fierce','Zippy','Sassy','Vibrant','Daring','Spicy','Funky','Cool','Wacky','Silly','Stormy','Mighty','Plucky','Brilliant','Crispy','Bouncy','Cheeky','Glowing','Snazzy','Quirky','Royal'];
+const NAME_NOUNS = ['Fox','Bear','Tiger','Eagle','Wolf','Panda','Shark','Phoenix','Dragon','Hawk','Penguin','Otter','Sloth','Koala','Ninja','Wizard','Pirate','Yeti','Falcon','Raven','Cat','Owl','Bunny','Toad','Mango','Pickle','Comet','Star','Llama','Whale','Goose','Beaver','Lemur','Moth','Squid'];
+function randomName() {
+  return NAME_ADJS[Math.floor(Math.random()*NAME_ADJS.length)] +
+         NAME_NOUNS[Math.floor(Math.random()*NAME_NOUNS.length)];
+}
 function showView(name) { Object.values(views).forEach(v => v.classList.remove('active')); views[name].classList.add('active'); }
 
 function esc(s) {
@@ -251,9 +270,9 @@ async function joinRoom(code, name) {
 
 // ── Home ───────────────────────────────────────────────────────────────────
 $('create-room-btn').addEventListener('click', async () => {
-  const name = $('username-input').value.trim();
-  if (!name) return showHomeErr('Enter your name first!');
-  myName = name; getAudio(); // unlock audio on first interaction
+  let name = $('username-input').value.trim();
+  if (!name) { name = randomName(); $('username-input').value = name; }
+  myName = name.slice(0, 30); getAudio();
   try {
     stopBrowsingLobbies();
     roomId = await createRoom(); isHost = true;
@@ -262,16 +281,20 @@ $('create-room-btn').addEventListener('click', async () => {
 });
 
 $('join-room-btn').addEventListener('click', async () => {
-  const name = $('username-input').value.trim();
+  let name = $('username-input').value.trim();
   const code = $('room-code-input').value.trim().toUpperCase();
-  if (!name) return showHomeErr('Enter your name first!');
   if (code.length < 3) return showHomeErr('Enter a room code!');
-  myName = name; getAudio();
+  if (!name) { name = randomName(); $('username-input').value = name; }
+  myName = name.slice(0, 30); getAudio();
   try {
     stopBrowsingLobbies();
-    await joinRoom(code, name); roomId = code; isHost = false;
+    await joinRoom(code, myName); roomId = code; isHost = false;
     listen(); enterLobby();
   } catch(e) { showHomeErr(e.message); }
+});
+
+$('random-name-btn').addEventListener('click', () => {
+  $('username-input').value = randomName();
 });
 
 $('username-input').addEventListener('keydown', e => { if (e.key === 'Enter') $('create-room-btn').click(); });
@@ -447,6 +470,21 @@ function listen() {
   });
 }
 
+// ── Edit my own name ───────────────────────────────────────────────────────
+async function editMyName() {
+  const n = prompt('Edit your name:', myName);
+  if (n === null) return;
+  const trimmed = n.trim().slice(0, 30);
+  if (!trimmed) return;
+  myName = trimmed;
+  $('tb-myname').textContent = myName;
+  if (roomId && lastRoom?.players?.[myId]) {
+    try {
+      await updateDoc(roomRef(roomId), { [`players.${myId}.name`]: myName });
+    } catch (e) { console.warn(e); }
+  }
+}
+
 // ── Kick player (host only) ────────────────────────────────────────────────
 async function kickPlayer(playerId) {
   if (!isHost || !lastRoom || playerId === myId) return;
@@ -503,7 +541,6 @@ function renderLobby(room) {
   Object.entries(room.players).sort((a,b) => a[1].order - b[1].order).forEach(([id, p]) => {
     const div = document.createElement('div');
     div.className = 'lobby-player-card';
-    const initials = p.name.slice(0,2).toUpperCase();
     const color = avatarColor(p.name);
     const canKick = isHost && id !== myId;
     let badge = '';
@@ -511,12 +548,13 @@ function renderLobby(room) {
     else if (id === myId)        badge = '<span class="lp-badge you">YOU</span>';
     const kickHint = canKick ? '<span class="kick-x" title="Click to kick">✕</span>' : '';
     if (canKick) div.classList.add('kickable');
-    div.innerHTML = `<div class="lp-avatar" style="background:${color}">${esc(initials)}</div>
-      <span>${esc(p.name)}</span>${badge}${kickHint}`;
+    div.style.borderLeft = `4px solid ${color}`;
+    div.innerHTML = `<span class="lp-name">${esc(p.name)}</span>${badge}${kickHint}`;
     if (canKick) div.addEventListener('click', () => kickPlayer(id));
     container.appendChild(div);
   });
-  $('start-btn').style.display = (isHost && room.hostId === myId) ? 'block' : 'none';
+  const sb = document.getElementById('start-btn');
+  if (sb) sb.style.display = (isHost && room.hostId === myId) ? 'block' : 'none';
   applySettingsToUI(room.settings || DEFAULT_SETTINGS);
 }
 
@@ -527,13 +565,15 @@ function renderGame(room) {
   $('tb-room').textContent  = roomId;
   $('tb-count').textContent = `${Object.keys(room.players).length} players`;
   $('tb-words').textContent = `(${room.wordCount || 0} words)`;
+  $('tb-myname').textContent = myName;
 
-  // Settings toggle button wires once
+  // Settings toggle button (wire once per render — idempotent)
   $('tb-settings-toggle').onclick = () => {
     const gs = $('game-settings');
     gs.classList.toggle('hidden');
     if (!gs.classList.contains('hidden')) renderGameSettings(s);
   };
+  $('edit-name-btn').onclick = editMyName;
 
   renderGameSettings(s);
   renderArena(room, s);
@@ -632,17 +672,17 @@ function renderArena(room, s) {
       ? '' // self typing shown in word bar, not node
       : (p.lastWord || '');
 
-    node.className = `pnode${isCurrent ? ' current-turn' : ''}${!p.isAlive ? ' eliminated' : ''}`;
+    const canKick = isHost && id !== myId;
+    node.className = `pnode${isCurrent ? ' current-turn' : ''}${!p.isAlive ? ' eliminated' : ''}${canKick ? ' kickable' : ''}`;
     node.style.left = `${x}px`;
     node.style.top  = `${y}px`;
     node.innerHTML  = `
-      <div class="pnode-name">
-        ${esc(p.name)}${id === myId ? '<span class="pnode-you">(you)</span>' : ''}
-        <span class="pnode-hearts">${hearts(p.lives, maxL)}</span>
-      </div>
-      <div class="pnode-avatar" style="background:${color}">${esc(p.name.slice(0,2).toUpperCase())}</div>
+      <div class="pnode-pill" style="background:${color}">${esc(p.name)}${id === myId ? ' <span class="pnode-you">(you)</span>' : ''}${canKick ? ' <span class="kick-x">✕</span>' : ''}</div>
+      <div class="pnode-hearts">${hearts(p.lives, maxL)}</div>
       <div class="pnode-word" id="pword-${id}">${wordWithHighlight(word, room.prompt || '')}</div>
     `;
+    if (canKick) node.addEventListener('click', () => kickPlayer(id));
+    if (id === myId) node.addEventListener('click', e => { if (!e.target.classList.contains('kick-x')) editMyName(); });
   });
 
   // Remove nodes for players who left
