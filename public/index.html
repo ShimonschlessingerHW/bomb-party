@@ -15,10 +15,17 @@
     <div class="home-logo">💣</div>
     <h1 class="home-title">BOMB PARTY</h1>
     <p class="home-sub">Type a word containing the letters before the bomb explodes!</p>
+
     <div class="home-card">
       <input id="username-input" class="inp" type="text" placeholder="Your name" maxlength="20" autocomplete="off">
-      <button id="create-room-btn" class="btn btn-green">Create Room</button>
-      <div class="home-or"><span>or join</span></div>
+      <button id="create-room-btn" class="btn btn-green">Create Public Room</button>
+
+      <div class="home-section-label">Active Lobbies</div>
+      <div id="public-lobbies-list" class="pl-list">
+        <div class="pl-empty">Loading lobbies…</div>
+      </div>
+
+      <div class="home-or"><span>or join by code</span></div>
       <div class="home-join">
         <input id="room-code-input" class="inp code-inp" type="text" placeholder="ROOM" maxlength="4" autocomplete="off">
         <button id="join-room-btn" class="btn btn-gray">Join</button>
@@ -80,10 +87,14 @@
         <div class="sgroup">
           <label class="slabel">🔁 Maximum prompt age (turns)</label>
           <p class="sdesc">If this many players fail, the prompt changes.</p>
-          <div class="slider-row">
+          <div class="slider-row" id="age-slider-row">
             <input id="s-age-n" class="snumber" type="number" value="2" min="1" max="10">
             <input id="s-age-r" class="sslider" type="range" min="1" max="10" value="2">
           </div>
+          <label class="check-row">
+            <input id="s-pass-around" type="checkbox">
+            <span>Pass around — change after all living players have failed</span>
+          </label>
         </div>
 
         <div class="sgroup">

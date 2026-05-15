@@ -1,5 +1,6 @@
 import { initializeApp }   from 'https://www.gstatic.com/firebasejs/10.11.0/firebase-app.js';
-import { getFirestore, doc, setDoc, getDoc, updateDoc, onSnapshot, arrayUnion }
+import { getFirestore, doc, setDoc, getDoc, updateDoc, deleteDoc, onSnapshot, arrayUnion,
+         collection, query, where, serverTimestamp }
   from 'https://www.gstatic.com/firebasejs/10.11.0/firebase-firestore.js';
 import firebaseConfig        from './firebase-config.js';
 import { isValidWord, randomPrompt } from './words.js';
@@ -15,8 +16,9 @@ let roomId   = '';
 let isHost   = false;
 let lastRoom = null;
 let roomUnsub = null;
-let timerRAF  = null;   // requestAnimationFrame handle
-let tickTO    = null;   // setTimeout handle for ticking
+let homeUnsub = null;   // listening to public lobbies
+let timerRAF  = null;
+let tickTO    = null;
 let gameClockTO = null;
 let submitting  = false;
 
@@ -25,6 +27,7 @@ const DEFAULT_SETTINGS = {
   difficulty:    'beginner',
   minDuration:   10,        // seconds
   maxPromptAge:  2,
+  passAroundMode: false,    // if true, prompt changes after all living players have failed
   startingLives: 2,
   maxLives:      3,
   maxPlayers:    16,
@@ -127,16 +130,24 @@ function playBonusLife() {
   } catch(e) {}
 }
 
-// Schedule ticking that accelerates as time runs out
+// Schedule ticking — silent until the last ~3s, then accelerates
 function startTicking(startTime, duration) {
   stopTicking();
   function tick() {
     const remaining = duration - (Date.now() - startTime);
     if (remaining <= 0) return;
+
+    // Stay silent until 3 seconds left
+    if (remaining > 3000) {
+      tickTO = setTimeout(tick, remaining - 3000 + 20);
+      return;
+    }
+
     playTick();
-    // Interval: 900ms at full time → 100ms at last second
-    const ratio = Math.max(0, remaining / duration);
-    const interval = Math.round(100 + ratio * 800);
+    let interval;
+    if      (remaining > 1500) interval = 500;
+    else if (remaining > 700)  interval = 250;
+    else                       interval = 110;
     tickTO = setTimeout(tick, interval);
   }
   tick();
@@ -164,8 +175,65 @@ async function createRoom() {
     usedWords: [], round: 1, winnerId: null,
     promptFailures: 0, wordCount: 0, gameStartTime: null, lastWord: null,
     pendingWord: null, settings: DEFAULT_SETTINGS,
+    createdAt: serverTimestamp(),
   });
   return code;
+}
+
+// ── Public lobby browser ───────────────────────────────────────────────────
+function startBrowsingLobbies() {
+  stopBrowsingLobbies();
+  const q = query(collection(db, 'rooms'), where('state', '==', 'lobby'));
+  homeUnsub = onSnapshot(q, snap => {
+    const rooms = [];
+    snap.forEach(d => rooms.push({ id: d.id, ...d.data() }));
+    renderPublicLobbies(rooms);
+  });
+}
+
+function stopBrowsingLobbies() {
+  if (homeUnsub) { homeUnsub(); homeUnsub = null; }
+}
+
+function renderPublicLobbies(rooms) {
+  const list = $('public-lobbies-list');
+  if (!list) return;
+  // Filter: must have at least one player (otherwise it's abandoned)
+  const valid = rooms.filter(r => Object.keys(r.players || {}).length > 0);
+  if (!valid.length) {
+    list.innerHTML = '<div class="pl-empty">No public lobbies right now — create one!</div>';
+    return;
+  }
+  // Sort: by player count desc, then by createdAt desc
+  valid.sort((a, b) => {
+    const ca = Object.keys(a.players || {}).length;
+    const cb = Object.keys(b.players || {}).length;
+    if (cb !== ca) return cb - ca;
+    return (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0);
+  });
+  list.innerHTML = '';
+  valid.forEach(room => {
+    const count = Object.keys(room.players || {}).length;
+    const max   = room.settings?.maxPlayers || 16;
+    const host  = room.players?.[room.hostId]?.name || 'Someone';
+    const card  = document.createElement('div');
+    card.className = 'pl-card';
+    card.innerHTML = `
+      <div class="pl-info">
+        <span class="pl-host">${esc(host)}'s room</span>
+        <span class="pl-meta">${count}/${max} players</span>
+      </div>
+      <div class="pl-code">${esc(room.id)}</div>
+      <button class="btn-pl-join">Join</button>
+    `;
+    card.querySelector('.btn-pl-join').addEventListener('click', () => {
+      const name = $('username-input').value.trim();
+      if (!name) { showHomeErr('Enter your name first!'); return; }
+      $('room-code-input').value = room.id;
+      $('join-room-btn').click();
+    });
+    list.appendChild(card);
+  });
 }
 
 async function joinRoom(code, name) {
@@ -187,6 +255,7 @@ $('create-room-btn').addEventListener('click', async () => {
   if (!name) return showHomeErr('Enter your name first!');
   myName = name; getAudio(); // unlock audio on first interaction
   try {
+    stopBrowsingLobbies();
     roomId = await createRoom(); isHost = true;
     listen(); enterLobby();
   } catch(e) { showHomeErr(e.message); }
@@ -199,6 +268,7 @@ $('join-room-btn').addEventListener('click', async () => {
   if (code.length < 3) return showHomeErr('Enter a room code!');
   myName = name; getAudio();
   try {
+    stopBrowsingLobbies();
     await joinRoom(code, name); roomId = code; isHost = false;
     listen(); enterLobby();
   } catch(e) { showHomeErr(e.message); }
@@ -223,7 +293,30 @@ $('copy-btn').addEventListener('click', () => {
   setTimeout(() => ($('copy-btn').textContent = '⎘'), 1500);
 });
 
-$('leave-btn').addEventListener('click', () => { cleanup(); showView('home'); });
+$('leave-btn').addEventListener('click', leaveLobby);
+
+async function leaveLobby() {
+  // Unsubscribe FIRST so we don't get a "kicked" alert on our own departure
+  if (roomUnsub) { roomUnsub(); roomUnsub = null; }
+  if (roomId && lastRoom) {
+    try {
+      if (isHost) {
+        await deleteDoc(roomRef(roomId));
+      } else {
+        const updatedPlayers = { ...lastRoom.players };
+        delete updatedPlayers[myId];
+        await updateDoc(roomRef(roomId), { players: updatedPlayers });
+      }
+    } catch (e) { /* ignore */ }
+  }
+  cleanup();
+  goHome();
+}
+
+function goHome() {
+  showView('home');
+  startBrowsingLobbies();
+}
 
 $('start-btn').addEventListener('click', async () => {
   if (!isHost) return;
@@ -271,6 +364,13 @@ linkSlider('s-lives-start-n', 's-lives-start-r', 'startingLives', Number);
 linkSlider('s-lives-max-n',   's-lives-max-r',   'maxLives',      Number);
 linkSlider('s-maxp-n',        's-maxp-r',        'maxPlayers',    Number);
 
+const passEl = $('s-pass-around');
+if (passEl) passEl.addEventListener('change', () => {
+  if (isHost) saveSettings('passAroundMode', passEl.checked);
+  const row = $('age-slider-row');
+  if (row) row.classList.toggle('disabled', passEl.checked);
+});
+
 // Bonus alphabet grid
 function initBonusGrid() {
   const grid = $('bonus-grid');
@@ -306,6 +406,12 @@ function applySettingsToUI(s) {
   set('s-lives-start-n',s.startingLives||2); set('s-lives-start-r', s.startingLives||2);
   set('s-lives-max-n',  s.maxLives || 3);    set('s-lives-max-r',   s.maxLives || 3);
   set('s-maxp-n',       s.maxPlayers||16);   set('s-maxp-r',        s.maxPlayers||16);
+  const pass = $('s-pass-around');
+  if (pass) {
+    pass.checked = !!s.passAroundMode;
+    const row = $('age-slider-row');
+    if (row) row.classList.toggle('disabled', !!s.passAroundMode);
+  }
   if (s.bonusAlphabet) {
     document.querySelectorAll('.bonus-count').forEach(inp => {
       const v = s.bonusAlphabet[inp.dataset.letter];
@@ -321,10 +427,52 @@ function applySettingsToUI(s) {
 function listen() {
   if (roomUnsub) roomUnsub();
   roomUnsub = onSnapshot(roomRef(roomId), snap => {
-    if (!snap.exists()) return;
-    lastRoom = snap.data();
+    if (!snap.exists()) {
+      // Room was deleted by host
+      cleanup();
+      alert('The host closed the room.');
+      goHome();
+      return;
+    }
+    const room = snap.data();
+    // Was I kicked?
+    if (!room.players[myId]) {
+      cleanup();
+      alert("You were removed from the room.");
+      goHome();
+      return;
+    }
+    lastRoom = room;
     handleUpdate(lastRoom);
   });
+}
+
+// ── Kick player (host only) ────────────────────────────────────────────────
+async function kickPlayer(playerId) {
+  if (!isHost || !lastRoom || playerId === myId) return;
+  const name = lastRoom.players[playerId]?.name || 'this player';
+  if (!confirm(`Kick ${name} from the room?`)) return;
+
+  const updated = { ...lastRoom.players };
+  delete updated[playerId];
+  const updates = { players: updated };
+
+  // If they were the current player mid-game, advance the turn
+  if (lastRoom.state === 'playing' && lastRoom.currentPlayerId === playerId) {
+    const nextId = nextAlivePlayer(updated, playerId);
+    if (nextId) {
+      updates.currentPlayerId = nextId;
+      updates.turnStartTime  = Date.now();
+      updates.pendingWord    = null;
+    } else {
+      // No one left alive — end game
+      const lastAlive = Object.entries(updated).filter(([,p]) => p.isAlive)[0];
+      updates.state    = 'gameOver';
+      updates.winnerId = lastAlive?.[0] || null;
+      updates.currentPlayerId = null;
+    }
+  }
+  await updateDoc(roomRef(roomId), updates);
 }
 
 function cleanup() {
@@ -357,12 +505,15 @@ function renderLobby(room) {
     div.className = 'lobby-player-card';
     const initials = p.name.slice(0,2).toUpperCase();
     const color = avatarColor(p.name);
+    const canKick = isHost && id !== myId;
     let badge = '';
-    if (id === room.hostId && id === myId) badge = '<span class="lp-badge host">HOST</span>';
-    else if (id === room.hostId)            badge = '<span class="lp-badge host">HOST</span>';
-    else if (id === myId)                   badge = '<span class="lp-badge you">YOU</span>';
+    if (id === room.hostId)      badge = '<span class="lp-badge host">HOST</span>';
+    else if (id === myId)        badge = '<span class="lp-badge you">YOU</span>';
+    const kickHint = canKick ? '<span class="kick-x" title="Click to kick">✕</span>' : '';
+    if (canKick) div.classList.add('kickable');
     div.innerHTML = `<div class="lp-avatar" style="background:${color}">${esc(initials)}</div>
-      <span>${esc(p.name)}</span>${badge}`;
+      <span>${esc(p.name)}</span>${badge}${kickHint}`;
+    if (canKick) div.addEventListener('click', () => kickPlayer(id));
     container.appendChild(div);
   });
   $('start-btn').style.display = (isHost && room.hostId === myId) ? 'block' : 'none';
@@ -424,21 +575,26 @@ function renderLeaderboard(room, s) {
   if (!tbody) return;
   const players = Object.entries(room.players).sort((a,b) => a[1].order - b[1].order);
   const ba = (s.settings || s).bonusAlphabet || DEFAULT_SETTINGS.bonusAlphabet;
-  tbody.innerHTML = players.map(([id, p]) => {
+  tbody.innerHTML = '';
+  players.forEach(([id, p]) => {
     const used   = p.lettersUsed || {};
     const needed = Object.entries(ba).filter(([,v]) => v > 0).length;
     const done   = Object.entries(ba).filter(([l,v]) => v > 0 && (used[l]||0) >= v).length;
     const isCur  = id === room.currentPlayerId;
     const isElim = !p.isAlive;
-    return `<tr class="${isCur ? 'lb-current' : ''} ${isElim ? 'lb-eliminated' : ''}">
-      <td class="lb-name">${esc(p.name)}${id === myId ? ' <span style="color:var(--accent);font-size:.65rem">(you)</span>' : ''}</td>
+    const canKick = isHost && id !== myId;
+    const tr = document.createElement('tr');
+    tr.className = `${isCur ? 'lb-current' : ''} ${isElim ? 'lb-eliminated' : ''} ${canKick ? 'kickable' : ''}`.trim();
+    tr.innerHTML = `
+      <td class="lb-name">${esc(p.name)}${id === myId ? ' <span style="color:var(--accent);font-size:.65rem">(you)</span>' : ''}${canKick ? ' <span class="kick-x">✕</span>' : ''}</td>
       <td>${p.wordCount || 0}</td>
       <td class="lb-alpha">${done}/${needed}</td>
       <td>${p.bonusEarned || 0}</td>
       <td>${p.longestWord || 0}</td>
-      <td class="lb-lives">${'❤'.repeat(Math.max(0, p.lives))}</td>
-    </tr>`;
-  }).join('');
+      <td class="lb-lives">${'❤'.repeat(Math.max(0, p.lives))}</td>`;
+    if (canKick) tr.addEventListener('click', () => kickPlayer(id));
+    tbody.appendChild(tr);
+  });
 }
 
 // ── Arena (circular layout) ────────────────────────────────────────────────
@@ -601,7 +757,6 @@ async function handleTimeout(room, s) {
   const newLives  = player.lives - 1;
   const stillAlive = newLives > 0;
   const newPromptAge = (room.promptFailures || 0) + 1;
-  const promptExpired = newPromptAge >= (settings.maxPromptAge || 2);
 
   const updatedPlayers = {
     ...room.players,
@@ -611,6 +766,12 @@ async function handleTimeout(room, s) {
   const alivePlayers = Object.entries(updatedPlayers)
     .filter(([,p]) => p.isAlive)
     .sort((a,b) => a[1].order - b[1].order);
+
+  // Pass-around mode: prompt changes after every living player has failed once
+  const effectiveMaxAge = settings.passAroundMode
+    ? Math.max(1, alivePlayers.length)
+    : (settings.maxPromptAge || 2);
+  const promptExpired = newPromptAge >= effectiveMaxAge;
 
   if (alivePlayers.length <= 1) {
     await updateDoc(roomRef(roomId), {
@@ -793,4 +954,8 @@ $('play-again-btn').addEventListener('click', async () => {
   enterLobby();
 });
 
-$('home-btn').addEventListener('click', () => { cleanup(); showView('home'); });
+$('home-btn').addEventListener('click', () => { cleanup(); goHome(); });
+
+// Start browsing lobbies on page load
+startBrowsingLobbies();
+initBonusGrid();
